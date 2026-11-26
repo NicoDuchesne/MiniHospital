@@ -23,8 +23,11 @@ namespace MiniHospital.Simulation.Characters
             WaitingForBusDeparting,
             Finished
         }
-
-        private Step step;
+        
+        //MES VARIABLES
+        private Thread employeeThread;
+        private object employeeLock = new();
+        private volatile Step step;
 
         public Employee(int spriteIndex, ServicePoint workplace, Hospital hospital, TimeRange patientHandlingRequiredTime)
             : base(spriteIndex)
@@ -35,6 +38,22 @@ namespace MiniHospital.Simulation.Characters
             PlaceAt(workPlace.StaffSlot);
             step = Step.WaitForPatient;
             this.patientHandlingRequiredTime = patientHandlingRequiredTime;
+        }
+
+        public void StartBrain() //lance le thread
+        {
+            employeeThread = new Thread(launchBrain);
+            hospital.AddThread(employeeThread);
+            employeeThread.Start();
+        }
+        
+        private void launchBrain()
+        {
+            while (step != Step.Finished)
+            {
+                Brain();
+                Thread.Sleep(1);
+            }
         }
 
         public void LeaveHospital()
@@ -59,46 +78,81 @@ namespace MiniHospital.Simulation.Characters
 
         public void HandlePatient(Patient newPatient)
         {
-            if(patient != null)
+            lock (employeeLock)
             {
-                //problem
-                throw new InvalidOperationException("Un employé reçoit un patient alors qu'il n'a pas encore fini avec le précédent");
-            }
-            if(step != Step.WaitForPatient)
-            {
-                throw new InvalidOperationException("Un employé reçoit un patient alors qu'il n'est pas en train d'en attendre un");
-            }
-            patient = newPatient;
+                if(patient != null)
+                {
+                    //problem
+                    throw new InvalidOperationException("Un employé reçoit un patient alors qu'il n'a pas encore fini avec le précédent");
+                }
+                if(step != Step.WaitForPatient)
+                {
+                    throw new InvalidOperationException("Un employé reçoit un patient alors qu'il n'est pas en train d'en attendre un");
+                }
+                patient = newPatient;
 
-            patientHandlingEndTime = hospital.ElapsedTimeSinceStart + patientHandlingRequiredTime.Sample();
-            SetBubbletype(BubbleType.Health);
-            step = Step.HandlePatient;
+                patientHandlingEndTime = hospital.ElapsedTimeSinceStart + patientHandlingRequiredTime.Sample();
+                SetBubbletype(BubbleType.Health);
+                step = Step.HandlePatient;
+            }
+        }
+        
+        public bool TryHandlePatient(Patient newPatient)
+        {
+            lock (employeeLock)
+            {
+                if (hospital.Phase != Hospital.DayPhase.Running || patient != null || step != Step.WaitForPatient)
+                {
+                    return false;
+                }
+                
+                if (patient != null || step != Step.WaitForPatient)
+                {
+                    return false;
+                }
+                
+                patient = newPatient;
+                patientHandlingEndTime = hospital.ElapsedTimeSinceStart + patientHandlingRequiredTime.Sample();
+                SetBubbletype(BubbleType.Health);
+                step = Step.HandlePatient;
+                return true;
+            }
         }
 
         private void FinishHandlingPatient()
         {
-            if(patient == null)
-            {
-                throw new Exception("FinishHandlingPatient appelé alors que patient est null");
-            }
+            Patient p;
+            Room? assigned = null;
+            
             if (workPlace is Reception)
             {
-                Room? assigned = hospital.ChooseValidRoom(false);
-                patient.RegistrationFinished(assigned);
+                assigned = hospital.ChooseValidRoom(false);
             }
             else if(workPlace is Room room)
             {
-                Room? assigned = null;
                 if (room.Config.Type == RoomType.Generalist && hospital.Phase == Hospital.DayPhase.Running && Random.Shared.NextDouble() < 0.35)
                 {
                     assigned = hospital.ChooseValidRoom(true);
                 }
-                patient.ConsultationFinished(assigned);
             }
 
-            patient = null;
-            SetBubbletype(BubbleType.None);
-            step = Step.WaitForPatient;
+            lock (employeeLock)
+            {
+                p = patient ?? throw new Exception("FinishHandlingPatient appelé alors que patient est null");
+                patient = null;
+                SetBubbletype(BubbleType.None);
+                step = Step.WaitForPatient;
+            }
+
+            if (workPlace is Reception)
+            {
+                p.RegistrationFinished(assigned);
+            }
+            else
+            {
+                p.ConsultationFinished(assigned);
+            }
+            
         }
 
         protected override void Brain()
@@ -106,10 +160,12 @@ namespace MiniHospital.Simulation.Characters
             switch(step)
             {
                 case Step.WaitForPatient:
-                    //attente, check fin de journée
-                    if (hospital.Phase != Hospital.DayPhase.Running)
+                    lock (employeeLock)
                     {
-                        LeaveHospital();
+                        if (hospital.Phase != Hospital.DayPhase.Running && patient == null && workPlace.Occupant == null)
+                        {
+                            LeaveHospital();
+                        }
                     }
                     break;
                 case Step.HandlePatient:
@@ -129,7 +185,8 @@ namespace MiniHospital.Simulation.Characters
                     if (!IsMoving)
                     {
                         step = Step.WaitingForBusDeparting;
-                        hospital.RegisterEmployeeBoarding(this);
+                        hospital.BoardBusAndWait(this); //monte dans le bus et barrier
+                        step = Step.Finished;
                     }
                     break;
                 case Step.WaitingForBusDeparting:

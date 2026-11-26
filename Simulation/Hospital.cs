@@ -3,18 +3,20 @@ using MiniHospital.Rendering;
 using MiniHospital.Simulation.Characters;
 using MiniHospital.Simulation.Rooms;
 using MiniHospital.Utils;
+using System.Collections.Concurrent;
 
 namespace MiniHospital.Simulation
 {
     public class Hospital
     {
         //configuration du TP: valeur de 0 = mode classique, autrmement le numéro de la question permet de mettre les comportements dans le mode adapté à la question
-        public static int CurrentQuestion { get; internal set; } = 0;
+        public static int CurrentQuestion { get; internal set; } = 5;
 
         //public pour l'affichage uniquement
         public List<Room> Rooms { get; private set; } = new List<Room>();
 
-        public DayPhase Phase { get; private set; }
+        private volatile DayPhase phase;
+        public DayPhase Phase => phase;  
 
         public HospitalStats DayStats { get; private set; } = new HospitalStats();
         public HospitalStats TotalStats { get; } = new HospitalStats();
@@ -23,7 +25,52 @@ namespace MiniHospital.Simulation
         public int EmployeeCount { get; private set; }
 
         public float SpeedMultiplier { get; set; } = 1f;
-
+        
+        //MES VARIABLES
+        private object charactersLock = new(); //verrou utlisié à chaque fois qu'on veut utiliser la liste characters
+        private object busLock = new(); //verrou pour le bus
+        private ConcurrentQueue<Slot> freeSeats = new(); //nouvelle liste des freeSeats utilisant une collection concurrent
+        private SemaphoreSlim receptionSemaphore; //semaphore pour les receptions
+        private int previousReceptionCount; //pour garder le compte du nb de réceptions
+        private Barrier busBarrier = new(1); //la barrière pour que le bus attende tout le monde
+        private object threadsLock = new(); //lock pour la liste des threads
+        private List<Thread> todayThreads = new(); //liste de nos threads
+        
+        //MES FONCTIONS
+        public void AddThread(Thread thread) //ajoute un thread à la liste
+        {
+            lock (threadsLock)
+            {
+                todayThreads.Add(thread);
+            }
+        }
+        
+        private void JoinTodayThreads() //attend tous les threads et renvoie une exception si un continue de tourner
+        {
+            Thread[] threads;
+            lock (threadsLock)
+            {
+                threads = todayThreads.ToArray();
+                todayThreads.Clear();
+            }
+            
+            foreach (Thread thread in threads)
+            {
+                if (!thread.Join(TimeSpan.FromSeconds(6)))
+                {
+                    throw new Exception("Au moins un thread continue de tourner");
+                }
+            }
+        }
+        
+        public void BoardBusAndWait(Employee employee) //employee monte à bord du bus et s'enregistre à la barrière
+        {
+            RegisterEmployeeBoarding(employee);
+            busBarrier.SignalAndWait();    
+        }
+        
+        //FONCTIONS DEJA PRESENTES (PARFOIS MODIFIEES)
+        
         public TimeSpan ClockTime
         {
             get
@@ -50,13 +97,13 @@ namespace MiniHospital.Simulation
         private List<Sprite> FurnituresSprites = new List<Sprite>();
 
         private List<Character> characters = new List<Character>();
-        private List<Slot> freeSeats = new();
+        
 
         private List<Reception> receptions = new List<Reception>();
         private List<Employee> employeesInBus = new List<Employee>();
         
         //pour l'affichage
-        public int EmployeesInBusCount => employeesInBus.Count;
+        public int EmployeesInBusCount { get { lock (busLock) return employeesInBus.Count; } }
 
 
         public enum DayPhase
@@ -74,6 +121,8 @@ namespace MiniHospital.Simulation
             StartDay(new DayConfig());
 
         }
+        
+        
 
         public void Initialize()
         {
@@ -93,12 +142,19 @@ namespace MiniHospital.Simulation
             }
 
             freeSeats.Clear();
-            freeSeats.AddRange(HospitalLayout.WaitingSeats);
+            foreach (Slot s in HospitalLayout.WaitingSeats)
+            {
+                freeSeats.Enqueue(s);
+            }
+                
 
             InitializeFurniture();
             Navigation.InitFullGraph();
 
-            characters.Clear();
+            lock (charactersLock)
+            {
+                characters.Clear();
+            }
             ElapsedTimeSinceStart = 0;
             CallBrainOnUpdate = Hospital.CurrentQuestion == 0? true : false;
         }
@@ -110,9 +166,12 @@ namespace MiniHospital.Simulation
             HandleDay(deltaTime);
 
             // copie pour autoriser la suppression du personnage courant dans Brain() sans causer d'exception
-            foreach (var character in characters.ToArray())
+            lock (charactersLock)
             {
-                character.Update(deltaTime);
+                foreach (var character in characters.ToArray())
+                {
+                    character.Update(deltaTime);
+                }
             }
         }
 
@@ -128,7 +187,7 @@ namespace MiniHospital.Simulation
                     if (elapsedTimeForToday >= dayConfig!.DayDuration)
                     {
                         elapsedTimeForToday = dayConfig.DayDuration;
-                        Phase = DayPhase.Closing;
+                        phase = DayPhase.Closing;
                     }
                     else
                     {
@@ -148,7 +207,7 @@ namespace MiniHospital.Simulation
                 case DayPhase.Closing:
                     if (employeesInBus.Count == EmployeeCount && DayStats.Active == 0)
                     {
-                        Phase = DayPhase.BusLeaving;
+                        phase = DayPhase.BusLeaving;
                         transitionTimer = 0f;
                     }
                     break;
@@ -157,12 +216,16 @@ namespace MiniHospital.Simulation
                     transitionTimer += deltaTime;
                     if (transitionTimer >= dayConfig!.DayTransitionDelay)
                     {
-                        foreach (Employee employee in employeesInBus)
+                        //le bus est censé partir car tous les employé ont signal and wait normalement
+                        if (!busBarrier.SignalAndWait(TimeSpan.FromSeconds(6)))
                         {
-                            employee.OnBusDeparted();
+                            throw new Exception("Il manque des emplyés dans le bus");
                         }
-                        employeesInBus.Clear();
-                        Phase = DayPhase.Finished;
+                        lock (busLock)
+                        {
+                            employeesInBus.Clear();
+                        }
+                        phase = DayPhase.Finished;
                     }
                     break;
 
@@ -176,12 +239,17 @@ namespace MiniHospital.Simulation
 
         public List<Sprite> GetRenderSprites()
         {
-
             var list = new List<Sprite>(FurnituresSprites);
-            foreach (var character in characters)
+
+            lock (charactersLock)
             {
-                character.GetRenderSprites(list);
+                foreach (var character in characters)
+                {
+                    character.GetRenderSprites(list);
+                }
             }
+            
+            
             return list;
         }
 
@@ -223,8 +291,38 @@ namespace MiniHospital.Simulation
 
         public void StartDay(DayConfig config)
         {
-            if (characters.Count != 0)
-                throw new Exception("Des personnages sont encore presents");
+            //Avant un nouveau jour, on s'assure que chacuns des éléments de multi threading soient "réinitialisé"
+            if (DayNumber > 0)
+            {
+                //tous les threads soient finis
+                JoinTodayThreads(); 
+                busBarrier.Dispose();
+
+                //Que la sémaphore a été entièrement libérée
+                if (receptionSemaphore.CurrentCount != previousReceptionCount)
+                {
+                    throw new Exception("La semaphore n'a pas été totalement release");
+                }
+                    
+                //Que tous les mutex soient libres
+                foreach (Room room in Rooms)
+                {
+                    if (!room.TryReleaseMutex())
+                    {
+                        throw new Exception("Un mutex est toujours lock");
+                    }
+                }
+                    
+            }
+            
+            var toStart = new List<Employee>();//liste des employés
+            
+            lock (charactersLock)
+            {
+                if (characters.Count != 0)
+                    throw new Exception("Des personnages sont encore presents");
+            }
+            
             if (DayNumber > 0 && freeSeats.Count != HospitalLayout.WaitingSeats.Length)
                 throw new Exception("Certains sièges n'ont pas été libérés la veille");
             if(employeesInBus.Count > 0)
@@ -233,6 +331,9 @@ namespace MiniHospital.Simulation
                 throw new Exception("Statistiques de la veille incohérentes");
 
             dayConfig = config;
+            //on crée notre sémaphore
+            receptionSemaphore = new SemaphoreSlim(config.ReceptionistCount, config.ReceptionistCount);
+            previousReceptionCount =  config.ReceptionistCount;
 
             DayNumber++;
             DayStats = new HospitalStats();
@@ -244,7 +345,11 @@ namespace MiniHospital.Simulation
 
 
             freeSeats.Clear();
-            freeSeats.AddRange(HospitalLayout.WaitingSeats);
+            foreach (Slot s in HospitalLayout.WaitingSeats)
+            {
+                freeSeats.Enqueue(s);
+            }
+                
 
             // Déterminer les salles ouvertes.
             int generalistIndex = 0;
@@ -295,8 +400,12 @@ namespace MiniHospital.Simulation
 
                 reception.Staff = employee;
                 employee.PlaceAt(reception.StaffSlot);
-                characters.Add(employee);
-                ++EmployeeCount;
+                lock (charactersLock)
+                {
+                    characters.Add(employee);
+                    toStart.Add(employee);
+                    ++EmployeeCount;
+                }
             }
 
             // Créer un médecin par salle ouverte.
@@ -326,19 +435,26 @@ namespace MiniHospital.Simulation
                 );
 
                 room.Staff = employee;
-                characters.Add(employee);
-                ++EmployeeCount;
+                lock (charactersLock)
+                {
+                    characters.Add(employee);
+                    toStart.Add(employee);
+                    ++EmployeeCount;
+                }
             }
-
-            Phase = DayPhase.Running;
+            
+            busBarrier = new Barrier(EmployeeCount + 1); //la barrière du bus est préparée
+            phase = DayPhase.Running;
+            foreach (var employee in toStart) //on lance les threads de chaque employé
+            {
+                employee.StartBrain();
+            }
         }
 
         private void SpawnPatient()
         {
-            DayStats.Arrived++;
-            TotalStats.Arrived++;
-            DayStats.Active++;
-            TotalStats.Active++;
+            DayStats.Add();
+            TotalStats.Add();
 
             Patient patient = new(
                 CharacterConfig.PatientSpriteIds[Random.Shared.Next(CharacterConfig.PatientSpriteIds.Length)],
@@ -347,32 +463,27 @@ namespace MiniHospital.Simulation
 
             patient.PlaceAt(NavNode.Outside);
 
-            characters.Add(patient);
-
+            lock (charactersLock)
+            {
+                characters.Add(patient);
+                patient.StartBrain();//A chaque spawn patient on lance le thread
+            }
         }
 
-        public Slot TakeFreeSeat()
+        public Slot TakeFreeSeat() //prend une place libre via une Concurrent Queue
         {
-            Slot seat;
-            if (freeSeats.Count == 0)
+            if (freeSeats.TryDequeue(out Slot? seat))
             {
-                //on renvoie une place debout non réservée. Pour le moment les persos vont stack dessus, pas grave c'est un TP pas un vrai jeu...
-                seat = HospitalLayout.StandingWaitingSlots[Random.Shared.Next(HospitalLayout.StandingWaitingSlots.Length)];
-            }else
-            {
-                seat = freeSeats[0];
                 Chaos.ExecuteIfEnabled();
-                freeSeats.RemoveAt(0);
+                return seat;
             }
 
-
-            return seat;
+            return HospitalLayout.StandingWaitingSlots[Random.Shared.Next(HospitalLayout.StandingWaitingSlots.Length)];
         }
 
         public void ReleaseSeat(Slot seat)
         {
-            //un peu hacky comme check mais ça passe avec la version actuelle (place assisse = réservée)
-            if(seat.Pose != CharacterAction.Sitting)
+            if (seat.Pose != CharacterAction.Sitting)
             {
                 return;
             }
@@ -380,55 +491,73 @@ namespace MiniHospital.Simulation
             {
                 throw new Exception("Un siège vient d'être libéré une 2e fois");
             }
-            Chaos.ExecuteIfEnabled();
-            freeSeats.Add(seat);
-        }
 
+            Chaos.ExecuteIfEnabled();
+            freeSeats.Enqueue(seat);
+        }
+        
         public void RegisterEmployeeBoarding(Employee employee)
         {
-            if (!characters.Remove(employee))
+            lock (charactersLock)
             {
-                throw new Exception("Enregistrement de départ d'un employé non présent dans l'hopital");
+                if (!characters.Remove(employee))
+                {
+                    throw new Exception("Enregistrement de départ d'un employé non présent dans l'hopital");
+                }
             }
-            if (employeesInBus.Contains(employee))
+
+            lock (busLock)
             {
-                throw new Exception("Employé est déjà dans le bus");
+                if (employeesInBus.Contains(employee))
+                {
+                    throw new Exception("Employé est déjà dans le bus");
+                }
+                employeesInBus.Add(employee);
             }
-            employeesInBus.Add(employee);
-            
         }
 
         public void RegisterPatientDeparture(Patient patient, bool treated)
         {
-            if (!characters.Remove(patient))
+            lock (charactersLock)
             {
-                throw new Exception("Enregistrement de départ d'un patient non présent dans l'hopital");
+                if (!characters.Remove(patient))
+                {
+                    throw new Exception("Enregistrement de départ d'un patient non présent dans l'hopital");
+                }
             }
-
-            DayStats.Active--;
-            TotalStats.Active--;
-            if (treated)
-            {
-                DayStats.Treated++;
-                TotalStats.Treated++;
-            }
-            else
-            {
-                DayStats.Untreated++;
-                TotalStats.Untreated++;
-            }
-            DayStats.UpdateScore(treated);
-            TotalStats.UpdateScore(treated);
+            
+            DayStats.Remove(treated);
+            TotalStats.Remove(treated);
         }
 
-        public Reception? TryGetReception()
+        public Reception? TryGetReception(Patient patient)
         {
+            if (Phase != DayPhase.Running) return null;
+            
+            if (!receptionSemaphore.Wait(0))
+            {
+                return null; //si on n'entre pas dans la semaphore on return null, comme ça la patience continue
+            }     
+            
             foreach (Reception candidate in receptions)
             {
-                if (candidate.IsOpen && candidate.Occupant == null && candidate.Staff != null && candidate.Staff.IsAvailable)
+                if (candidate.IsOpen && candidate.Staff != null && candidate.Staff.IsAvailable && candidate.TryAssignPatient(patient))
+                {
                     return candidate;
+                }
             }
+            
+            receptionSemaphore.Release();
             return null;
+        }
+        
+        public void ReleaseReception(Reception reception, Patient patient)
+        {
+            if (reception.TryReleasePatient(patient))
+            {
+                receptionSemaphore.Release();
+            }
+            
         }
     }
 }

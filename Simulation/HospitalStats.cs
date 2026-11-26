@@ -2,27 +2,75 @@
 {
     public class HospitalStats
     {
-        public int Arrived;
-        public int Treated;
-        public int Untreated;
-        public int Active;
+        //the lock
+        private object statsLock = new();
+        
+        //fields
+        private int arrived;
+        private int treated;
+        private int untreated;
+        private int active;
+        private int score;
+        private int combo;
+        private int bestCombo;
+        
+        //properties
+        public int Arrived { get { lock (statsLock) return arrived; } }
+        public int Treated { get { lock (statsLock) return treated; } }
+        public int Untreated { get { lock (statsLock) return untreated; } }
+        public int Active { get { lock (statsLock) return active; } }
+        public int Score { get { lock (statsLock) return score; } }
+        public int Combo { get { lock (statsLock) return combo; } }
+        public int BestCombo { get { lock (statsLock) return bestCombo; } }
 
-        public int Score;
-        public int Combo;
-        public int BestCombo;
-
-        public void UpdateScore(bool treated)
+        //ajout d'un patient
+        public void Add()
         {
-            if (treated)
+            lock (statsLock)
             {
-                Combo++;
-                Score += 100 * Combo;
-                if (Combo > BestCombo)
-                    BestCombo = Combo;
+                arrived++; 
+                active++;
             }
-            else
+        }
+        
+        //depart d'un patient
+        public void Remove(bool wasTreated)
+        {
+            lock (statsLock)
             {
-                Combo = 0;
+                active--;
+                if (wasTreated)
+                {
+                    treated++;
+                    combo++;
+                    score += 100 * combo;
+                    if (combo > bestCombo)
+                        bestCombo = combo;
+                }
+                else
+                {
+                    untreated++;
+                    combo = 0;
+                }
+            }
+        }
+        
+        //ancienne fontion update
+        public void UpdateScore(bool wasTreated)
+        {
+            lock (statsLock)
+            {
+                if (wasTreated)
+                {
+                    combo++;
+                    score += 100 * combo;
+                    if (combo > bestCombo)
+                        bestCombo = combo;
+                }
+                else
+                {
+                    combo = 0;
+                }
             }
         }
     }
