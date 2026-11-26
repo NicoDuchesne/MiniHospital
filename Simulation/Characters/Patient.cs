@@ -12,13 +12,20 @@ namespace MiniHospital.Simulation.Characters
 
 
         private Hospital hospital;
-        private Step step = Step.Arriving;
+        private volatile Step step = Step.Arriving;
 
         private GaugeSprite gaugeSprite;
         private bool wasTreated;
         private float waitingStartedAt;
         private Slot? waitingSeat;
         private float maxPatience;
+        
+        //MES VARIABLES
+        private Thread patientThread;
+        private volatile bool consultationDone;
+        private Room? nextRoom;
+        private volatile bool registrationDone;
+        private Room? registrationRoom;
 
         public Patient(int spriteIndex, Hospital hospital, float maxPatience) : base(spriteIndex)
         {
@@ -26,6 +33,23 @@ namespace MiniHospital.Simulation.Characters
             SetRenderScale(CharacterConfig.PatientScale);
             gaugeSprite = new GaugeSprite();
             this.maxPatience = maxPatience;
+        }
+        
+        //lance le thread
+        public void StartBrain()
+        {
+            patientThread = new Thread(launchBrain);
+            hospital.AddThread(patientThread);
+            patientThread.Start();
+        }
+
+        private void launchBrain()
+        {
+            while (step != Step.Finished)
+            {
+                Brain();
+                Thread.Sleep(1);
+            }
         }
 
         private enum Step
@@ -75,52 +99,30 @@ namespace MiniHospital.Simulation.Characters
 
         public void RegistrationFinished(Room? room)
         {
-            if (step != Step.AtReception || AssignedReception == null)
-                throw new InvalidOperationException("Enregistrement termine hors de l'accueil");
-
-            AssignedRoom = room;
-            AssignedReception.ReleasePatient(this);
-            AssignedReception = null;
-            if (AssignedRoom == null || hospital.Phase != Hospital.DayPhase.Running)
-                StartLeaving(false);
-            else
-                GoToWaiting();
+            registrationRoom = room;
+            registrationDone = true;
         }
 
         public void ConsultationFinished(Room? specialist)
         {
-            if (step != Step.InConsultation || AssignedRoom == null)
-                throw new InvalidOperationException("Consultation terminee hors consultation");
-
-            AssignedRoom.ReleasePatient(this);
-            AssignedRoom = null;
-
-            if (specialist != null && hospital.Phase == Hospital.DayPhase.Running)
-            {
-                AssignedRoom = specialist;
-                GoToWaiting();
-            }
-            else
-            {
-                // Une orientation non realisee a la fermeture reste non soignee.
-                StartLeaving(specialist == null);
-            }
+            nextRoom = specialist;
+            consultationDone = true;
         }
 
         private bool TryGotoReception()
         {
-            Reception? reception = hospital.TryGetReception();
-            if(reception != null)
+            Reception? reception = hospital.TryGetReception(this);
+            if (reception == null)
             {
-                reception.AssignPatient(this);
-                AssignedReception = reception;
-                ReleaseWaitingSeat();
-                MoveTo(reception.PatientSlot);
-                SetBubbletype(BubbleType.Question);
-                SetCurrentStep(Step.GoingToReception);
-                return true;
+                return false;
             }
-            return false;
+            
+            AssignedReception = reception;
+            ReleaseWaitingSeat();
+            MoveTo(reception.PatientSlot);
+            SetBubbletype(BubbleType.Question);
+            SetCurrentStep(Step.GoingToReception);
+            return true;
         }
 
         private void GoToWaiting()
@@ -158,12 +160,16 @@ namespace MiniHospital.Simulation.Characters
             wasTreated = treated;
             ReleaseWaitingSeat();
 
-            if (AssignedReception?.Occupant == this)
-                AssignedReception.ReleasePatient(this);
+            if (AssignedReception != null)
+            {
+                hospital.ReleaseReception(AssignedReception, this);
+            }
             AssignedReception = null;
 
-            if (AssignedRoom?.Occupant == this)
-                AssignedRoom.ReleasePatient(this);
+            if (AssignedRoom != null)
+            {
+                AssignedRoom.Exit(this);
+            }
             AssignedRoom = null;
 
             SetBubbletype(treated ? BubbleType.Done : BubbleType.Angry);
@@ -204,12 +210,34 @@ namespace MiniHospital.Simulation.Characters
                     if (!IsMoving)
                     {
                         SetCurrentStep(Step.AtReception);
-                        if(step == Step.AtReception)
-                            AssignedReception!.Staff!.HandlePatient(this);
+                        if (step == Step.AtReception)
+                        {
+                            Employee? staff = AssignedReception?.Staff;
+                            if (staff == null || !staff.TryHandlePatient(this))
+                            {
+                                StartLeaving(false);
+                            }
+                        }
                     }
                     break;
 
                 case Step.AtReception:
+                    if (registrationDone)
+                    {
+                        registrationDone = false;
+                        AssignedRoom = registrationRoom;
+                        hospital.ReleaseReception(AssignedReception!, this);
+                        AssignedReception = null;
+
+                        if (AssignedRoom == null || hospital.Phase != Hospital.DayPhase.Running)
+                        {
+                            StartLeaving(false);
+                        }
+                        else
+                        {
+                            GoToWaiting();
+                        }
+                    }
                     break;
 
                 case Step.GoingToWaiting:
@@ -230,11 +258,11 @@ namespace MiniHospital.Simulation.Characters
                     if (WaitOrGiveUp())
                         break;
 
-                    if (AssignedRoom != null && AssignedRoom.IsOpen &&
-                        AssignedRoom.Occupant == null &&
-                        AssignedRoom.Staff?.IsAvailable == true)
+                    if (hospital.Phase == Hospital.DayPhase.Running &&
+                        AssignedRoom != null && AssignedRoom.IsOpen &&
+                        AssignedRoom.Staff?.IsAvailable == true &&
+                        AssignedRoom.TryEnter(this))
                     {
-                        AssignedRoom.AssignPatient(this);
                         ReleaseWaitingSeat();
                         MoveTo(AssignedRoom);
                         SetBubbletype(BubbleType.Health);
@@ -245,12 +273,31 @@ namespace MiniHospital.Simulation.Characters
                 case Step.GoingToRoom:
                     if (!IsMoving)
                     {
-                        AssignedRoom!.Staff!.HandlePatient(this);
                         SetCurrentStep(Step.InConsultation);
+                        Employee? employee = AssignedRoom!.Staff;
+                        if (employee == null || !employee.TryHandlePatient(this))
+                        {
+                            StartLeaving(false);
+                        }
                     }
                     break;
 
                 case Step.InConsultation:
+                    if (consultationDone)
+                    {
+                        consultationDone = false;
+                        Room? specialist = nextRoom;
+                        AssignedRoom!.Exit(this);                  
+                        AssignedRoom = null;
+
+                        if (specialist != null && hospital.Phase == Hospital.DayPhase.Running)
+                        {
+                            AssignedRoom = specialist;
+                            GoToWaiting();                      
+                        }
+                        else
+                            StartLeaving(specialist == null);
+                    }
                     break;
 
                 case Step.Leaving:
